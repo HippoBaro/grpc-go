@@ -312,19 +312,20 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 	}
 
 	cs := &clientStream{
-		callHdr:      callHdr,
-		ctx:          ctx,
-		methodConfig: &mc,
-		opts:         opts,
-		callInfo:     c,
-		cc:           cc,
-		desc:         desc,
-		codec:        c.codec,
-		cp:           cp,
-		comp:         comp,
-		cancel:       cancel,
-		firstAttempt: true,
-		onCommit:     onCommit,
+		callHdr:           callHdr,
+		ctx:               ctx,
+		methodConfig:      &mc,
+		opts:              opts,
+		callInfo:          c,
+		cc:                cc,
+		desc:              desc,
+		codec:             c.codec,
+		cp:                cp,
+		comp:              comp,
+		cancel:            cancel,
+		firstAttempt:      true,
+		onCommit:          onCommit,
+		encoderBufferPool: c.encoderBufferPool,
 	}
 	if !cc.dopts.disableRetry {
 		cs.retryThrottler = cc.retryThrottler.Load().(*retryThrottler)
@@ -445,12 +446,13 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
 	}
 
 	return &csAttempt{
-		ctx:           ctx,
-		beginTime:     beginTime,
-		cs:            cs,
-		dc:            cs.cc.dopts.dc,
-		statsHandlers: shs,
-		trInfo:        trInfo,
+		ctx:               ctx,
+		beginTime:         beginTime,
+		cs:                cs,
+		dc:                cs.cc.dopts.dc,
+		statsHandlers:     shs,
+		trInfo:            trInfo,
+		encoderBufferPool: cs.encoderBufferPool,
 	}, nil
 }
 
@@ -559,10 +561,11 @@ type clientStream struct {
 	// place where we need to check if the attempt is nil.
 	attempt *csAttempt
 	// TODO(hedging): hedging will have multiple attempts simultaneously.
-	committed  bool // active attempt committed for retry?
-	onCommit   func()
-	buffer     []func(a *csAttempt) error // operations to replay on retry
-	bufferSize int                        // current size of buffer
+	committed         bool // active attempt committed for retry?
+	onCommit          func()
+	buffer            []func(a *csAttempt) error // operations to replay on retry
+	bufferSize        int                        // current size of buffer
+	encoderBufferPool SharedBufferPool
 }
 
 // csAttempt implements a single transport stream attempt within a
@@ -593,6 +596,8 @@ type csAttempt struct {
 	allowTransparentRetry bool
 	// set for pick errors that are returned as a status
 	drop bool
+
+	encoderBufferPool SharedBufferPool
 }
 
 func (cs *clientStream) commitAttemptLocked() {
@@ -884,7 +889,7 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, cs.codec, cs.cp, cs.comp)
+	hdr, payload, data, err := prepareMsg(m, cs.codec, cs.cp, cs.comp, cs.encoderBufferPool)
 	if err != nil {
 		return err
 	}
@@ -906,6 +911,7 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 			binlog.Log(cs.ctx, cm)
 		}
 	}
+
 	return err
 }
 
@@ -1036,7 +1042,16 @@ func (a *csAttempt) sendMsg(m any, hdr, payld, data []byte) error {
 		}
 		a.mu.Unlock()
 	}
-	if err := a.t.Write(a.s, hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
+
+	var release func() = nil
+	encoderBufferPool := a.encoderBufferPool
+	if encoderBufferPool != nil {
+		release = func() {
+			encoderBufferPool.Put(&data)
+		}
+	}
+
+	if err := a.t.Write(a.s, hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams, OnWrittenToTransport: release}); err != nil {
 		if !cs.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -1250,17 +1265,18 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 
 	// Use a special addrConnStream to avoid retry.
 	as := &addrConnStream{
-		callHdr:  callHdr,
-		ac:       ac,
-		ctx:      ctx,
-		cancel:   cancel,
-		opts:     opts,
-		callInfo: c,
-		desc:     desc,
-		codec:    c.codec,
-		cp:       cp,
-		comp:     comp,
-		t:        t,
+		callHdr:           callHdr,
+		ac:                ac,
+		ctx:               ctx,
+		cancel:            cancel,
+		opts:              opts,
+		callInfo:          c,
+		desc:              desc,
+		codec:             c.codec,
+		cp:                cp,
+		comp:              comp,
+		t:                 t,
+		encoderBufferPool: c.encoderBufferPool,
 	}
 
 	s, err := as.t.NewStream(as.ctx, as.callHdr)
@@ -1295,25 +1311,26 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 }
 
 type addrConnStream struct {
-	s         *transport.Stream
-	ac        *addrConn
-	callHdr   *transport.CallHdr
-	cancel    context.CancelFunc
-	opts      []CallOption
-	callInfo  *callInfo
-	t         transport.ClientTransport
-	ctx       context.Context
-	sentLast  bool
-	desc      *StreamDesc
-	codec     baseCodec
-	cp        Compressor
-	comp      encoding.Compressor
-	decompSet bool
-	dc        Decompressor
-	decomp    encoding.Compressor
-	p         *parser
-	mu        sync.Mutex
-	finished  bool
+	s                 *transport.Stream
+	ac                *addrConn
+	callHdr           *transport.CallHdr
+	cancel            context.CancelFunc
+	opts              []CallOption
+	callInfo          *callInfo
+	t                 transport.ClientTransport
+	ctx               context.Context
+	sentLast          bool
+	desc              *StreamDesc
+	codec             baseCodec
+	cp                Compressor
+	comp              encoding.Compressor
+	decompSet         bool
+	dc                Decompressor
+	decomp            encoding.Compressor
+	p                 *parser
+	mu                sync.Mutex
+	finished          bool
+	encoderBufferPool SharedBufferPool
 }
 
 func (as *addrConnStream) Header() (metadata.MD, error) {
@@ -1366,7 +1383,7 @@ func (as *addrConnStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payld, _, err := prepareMsg(m, as.codec, as.cp, as.comp)
+	hdr, payld, data, err := prepareMsg(m, as.codec, as.cp, as.comp, as.encoderBufferPool)
 	if err != nil {
 		return err
 	}
@@ -1376,7 +1393,15 @@ func (as *addrConnStream) SendMsg(m any) (err error) {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payld), *as.callInfo.maxSendMessageSize)
 	}
 
-	if err := as.t.Write(as.s, hdr, payld, &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
+	var release func() = nil
+	encoderBufferPool := as.encoderBufferPool
+	if encoderBufferPool != nil {
+		release = func() {
+			encoderBufferPool.Put(&data)
+		}
+	}
+
+	if err := as.t.Write(as.s, hdr, payld, &transport.Options{Last: !as.desc.ClientStreams, OnWrittenToTransport: release}); err != nil {
 		if !as.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -1553,6 +1578,8 @@ type serverStream struct {
 	// synchronized.
 	serverHeaderBinlogged bool
 
+	encoderBufferPool SharedBufferPool
+
 	mu sync.Mutex // protects trInfo.tr after the service handler runs.
 }
 
@@ -1638,7 +1665,7 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp)
+	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp, ss.encoderBufferPool)
 	if err != nil {
 		return err
 	}
@@ -1647,7 +1674,16 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	if len(payload) > ss.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), ss.maxSendMessageSize)
 	}
-	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false}); err != nil {
+
+	var release func() = nil
+	encoderBufferPool := ss.encoderBufferPool
+	if encoderBufferPool != nil {
+		release = func() {
+			encoderBufferPool.Put(&data)
+		}
+	}
+
+	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false, OnWrittenToTransport: release}); err != nil {
 		return toRPCErr(err)
 	}
 	if len(ss.binlogs) != 0 {
@@ -1756,13 +1792,13 @@ func MethodFromServerStream(stream ServerStream) (string, bool) {
 // prepareMsg returns the hdr, payload and data
 // using the compressors passed or using the
 // passed preparedmsg
-func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor) (hdr, payload, data []byte, err error) {
+func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor, encoderBufferPool SharedBufferPool) (hdr, payload, data []byte, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.payload, preparedMsg.encodedData, nil
 	}
 	// The input interface is not a prepared msg.
 	// Marshal and Compress the data at this point
-	data, err = encode(codec, m)
+	data, err = encode(codec, m, encoderBufferPool)
 	if err != nil {
 		return nil, nil, nil, err
 	}

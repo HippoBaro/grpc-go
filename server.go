@@ -176,6 +176,7 @@ type serverOptions struct {
 	headerTableSize       *uint32
 	numServerWorkers      uint32
 	recvBufferPool        SharedBufferPool
+	encoderBufferPool     SharedBufferPool
 }
 
 var defaultServerOptions = serverOptions{
@@ -185,6 +186,7 @@ var defaultServerOptions = serverOptions{
 	writeBufferSize:       defaultWriteBufSize,
 	readBufferSize:        defaultReadBufSize,
 	recvBufferPool:        nopBufferPool{},
+	encoderBufferPool:     nil,
 }
 var globalServerOptions []ServerOption
 
@@ -587,6 +589,12 @@ func NumStreamWorkers(numServerWorkers uint32) ServerOption {
 func RecvBufferPool(bufferPool SharedBufferPool) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
 		o.recvBufferPool = bufferPool
+	})
+}
+
+func ServerEncoderBufferPool(bufferPool SharedBufferPool) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		o.encoderBufferPool = bufferPool
 	})
 }
 
@@ -1106,7 +1114,7 @@ func (s *Server) incrCallsFailed() {
 }
 
 func (s *Server) sendResponse(ctx context.Context, t transport.ServerTransport, stream *transport.Stream, msg any, cp Compressor, opts *transport.Options, comp encoding.Compressor) error {
-	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
+	data, err := encode(s.getCodec(stream.ContentSubtype()), msg, s.opts.encoderBufferPool)
 	if err != nil {
 		channelz.Error(logger, s.channelzID, "grpc: server failed to encode response: ", err)
 		return err
@@ -1121,12 +1129,21 @@ func (s *Server) sendResponse(ctx context.Context, t transport.ServerTransport, 
 	if len(payload) > s.opts.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", len(payload), s.opts.maxSendMessageSize)
 	}
+
+	encoderBufferPool := s.opts.encoderBufferPool
+	if encoderBufferPool != nil {
+		opts.OnWrittenToTransport = func() {
+			encoderBufferPool.Put(&data)
+		}
+	}
+
 	err = t.Write(stream, hdr, payload, opts)
 	if err == nil {
 		for _, sh := range s.opts.statsHandlers {
 			sh.HandleRPC(ctx, outPayload(false, msg, data, payload, time.Now()))
 		}
 	}
+
 	return err
 }
 
@@ -1520,6 +1537,7 @@ func (s *Server) processStreamingRPC(ctx context.Context, t transport.ServerTran
 		maxSendMessageSize:    s.opts.maxSendMessageSize,
 		trInfo:                trInfo,
 		statsHandler:          shs,
+		encoderBufferPool:     s.opts.encoderBufferPool,
 	}
 
 	if len(shs) != 0 || trInfo != nil || channelz.IsOn() {

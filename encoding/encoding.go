@@ -99,6 +99,20 @@ type Codec interface {
 	Name() string
 }
 
+type SharedBufferPool interface {
+	// Get returns a buffer with specified length from the pool.
+	//
+	// The returned byte slice may be not zero initialized.
+	Get(length int) []byte
+
+	// Put returns a buffer to the pool.
+	Put(*[]byte)
+}
+
+type BufferedCodec interface {
+	MarshalWithBuffer(v any, pool SharedBufferPool) ([]byte, error)
+}
+
 var registeredCodecs = make(map[string]Codec)
 
 // RegisterCodec registers the provided Codec for use with all gRPC clients and

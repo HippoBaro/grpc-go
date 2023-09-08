@@ -79,6 +79,7 @@ type dialOptions struct {
 	resolvers                   []resolver.Builder
 	idleTimeout                 time.Duration
 	recvBufferPool              SharedBufferPool
+	encoderBufferPool           SharedBufferPool
 }
 
 // DialOption configures how we set up the connection.
